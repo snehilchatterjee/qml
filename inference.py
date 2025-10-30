@@ -12,7 +12,9 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from torch.cuda.amp import GradScaler, autocast
+# Updated imports for torch.amp (replaces torch.cuda.amp)
+from torch.amp import GradScaler
+from torch.amp import autocast
 from tqdm.auto import tqdm
 import gc
 import json
@@ -45,12 +47,12 @@ sample_tfms = [
 train_tfms = A.Compose([
     *sample_tfms,
     A.Resize(224,224),
-    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5],always_apply=True),
+    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5]),
     ToTensorV2()
 ])
 valid_tfms = A.Compose([
     A.Resize(224,224),
-    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5],always_apply=True),
+    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5]),
     ToTensorV2()
 ])
 
@@ -183,6 +185,18 @@ class QuantumAttentionGate(nn.Module):
             return [qml.expval(qml.PauliZ(i)) for i in range(cfg.num_qubits)]
 
         self.circuit = circuit
+
+    def _apply(self, fn):
+        """
+        Override _apply to keep quantum-related modules on CPU even when the model is moved to CUDA.
+        This ensures to_angles, post, and q_weights always remain on CPU for the PQC computation.
+        """
+        super()._apply(fn)
+        # Force these specific modules/parameters back to CPU after any device movement
+        self.to_angles = self.to_angles.to("cpu")
+        self.post = self.post.to("cpu")
+        self.q_weights.data = self.q_weights.data.to("cpu")
+        return self
 
     def _run_pqc_on_batch(self, angles_cpu: torch.Tensor):
         """
@@ -474,12 +488,13 @@ class GPT2Block(nn.Module):
 
 
 class VisionGPT2Model(nn.Module):
-    def __init__(self,config):
+    def __init__(self, config, qcfg):
         super().__init__()
 
         self.config = config
+        self.qcfg = qcfg   # save qcfg
 
-        vit = create_model('vit_base_patch16_224',pretrained=True,num_classes=0)
+        vit = create_model('vit_base_patch16_224', pretrained=True, num_classes=0)
         self.patch_embed = vit.patch_embed
         num_patches = self.patch_embed.num_patches
 
@@ -491,13 +506,13 @@ class VisionGPT2Model(nn.Module):
         self.blocks = nn.ModuleList([vit.blocks[i] for i in range(config.depth)])
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size,config.embed_dim),
-            wpe = nn.Embedding(config.seq_len,config.embed_dim),
+            wte = nn.Embedding(config.vocab_size, config.embed_dim),
+            wpe = nn.Embedding(config.seq_len, config.embed_dim),
             drop = nn.Dropout(config.emb_dropout),
-            h = nn.ModuleList([GPT2Block(config) for _ in range(config.depth)]),
+            h = nn.ModuleList([GPT2Block(config, qcfg) for _ in range(config.depth)]),  # pass qcfg
             ln_f = nn.LayerNorm(config.embed_dim)
         ))
-        self.lm_head = nn.Linear(config.embed_dim,config.vocab_size,bias=False)
+        self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
 
     def _pos_embed(self,x):
@@ -546,8 +561,8 @@ class VisionGPT2Model(nn.Module):
                 layer.requires_grad = True
 
     @classmethod
-    def from_pretrained(self,config):
-        model = VisionGPT2Model(config)
+    def from_pretrained(self, config, qcfg):
+        model = VisionGPT2Model(config, qcfg)
         sd = model.state_dict()
         keys = sd.keys()
         ignore_matches = ['blocks.','cross_attn.','ln_3','cls_token','pos_embed','patch_embed.','.attn.mask']
@@ -643,15 +658,31 @@ train_config = SimpleNamespace(
 
 
 # Load the model and move it to the appropriate device
-model = torch.load('./captioner.pt')
+# Create QAGConfig
+qcfg = QAGConfig(
+    num_qubits=8,
+    q_layers=2,
+    diff_method="backprop",
+    use_lightning=False,
+    diff_device="cpu",
+    scale_range=0.5,
+    reduce="mean"
+)
+
+# Instantiate the model
+model = VisionGPT2Model.from_pretrained(model_config, qcfg)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model.to(device)
+
+# Load the saved state dict
+state_dict = torch.load('./captioner.pt')
+model.load_state_dict(state_dict)
 
 def generate_caption( image, max_tokens=200, temperature=1.0, deterministic=False):
     # model.eval()
     gen_tfms = A.Compose([
         A.Resize(224, 224),
-        A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], always_apply=True),
+        A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ToTensorV2()
     ])
     image = Image.open(image).convert('RGB')
@@ -677,19 +708,35 @@ import json
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 
-from langchain.document_loaders import (CSVLoader,DirectoryLoader,TextLoader)
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain.chains import create_qa_with_sources_chain
-from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-from langchain.chains import create_qa_with_sources_chain
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain.vectorstores import Chroma
-from langchain.embeddings.base import Embeddings
-from langchain.llms.base import LLM
+# Updated langchain imports for newer versions
+try:
+    from langchain_community.document_loaders import CSVLoader, DirectoryLoader, TextLoader
+    from langchain_community.vectorstores import Chroma
+    from langchain_core.embeddings import Embeddings
+    from langchain_core.language_models.llms import LLM
+except ImportError:
+    # Fallback for older versions
+    from langchain.document_loaders import CSVLoader, DirectoryLoader, TextLoader
+    from langchain.vectorstores import Chroma
+    from langchain.embeddings.base import Embeddings
+    from langchain.llms.base import LLM
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except ImportError:
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+try:
+    from langchain.chains import LLMChain, create_qa_with_sources_chain, ConversationalRetrievalChain
+    from langchain_core.prompts import PromptTemplate
+    from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    from langchain_core.memory import ConversationBufferMemory
+except ImportError:
+    from langchain.chains import LLMChain, create_qa_with_sources_chain, ConversationalRetrievalChain
+    from langchain.prompts import PromptTemplate
+    from langchain.chains.combine_documents.stuff import StuffDocumentsChain
+    from langchain.memory import ConversationBufferMemory
+
 from typing import List, Optional, Any
 
 # Custom Groq LLM class

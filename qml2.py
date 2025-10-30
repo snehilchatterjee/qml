@@ -12,7 +12,9 @@ from albumentations.pytorch import ToTensorV2
 from PIL import Image
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-from torch.cuda.amp import GradScaler, autocast
+# Updated imports for torch.amp (replaces torch.cuda.amp)
+from torch.amp import GradScaler
+from torch.amp import autocast
 from tqdm.auto import tqdm
 import gc
 import json
@@ -38,12 +40,12 @@ sample_tfms = [
 train_tfms = A.Compose([
     *sample_tfms,
     A.Resize(224,224),
-    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5],always_apply=True),
+    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5]),
     ToTensorV2()
 ])
 valid_tfms = A.Compose([
     A.Resize(224,224),
-    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5],always_apply=True),
+    A.Normalize(mean=[0.5,0.5,0.5],std=[0.5,0.5,0.5]),
     ToTensorV2()
 ])
 
@@ -211,6 +213,18 @@ class QuantumAttentionGate(nn.Module):
 
         self.circuit = circuit
 
+    def _apply(self, fn):
+        """
+        Override _apply to keep quantum-related modules on CPU even when the model is moved to CUDA.
+        This ensures to_angles, post, and q_weights always remain on CPU for the PQC computation.
+        """
+        super()._apply(fn)
+        # Force these specific modules/parameters back to CPU after any device movement
+        self.to_angles = self.to_angles.to("cpu")
+        self.post = self.post.to("cpu")
+        self.q_weights.data = self.q_weights.data.to("cpu")
+        return self
+
     def _run_pqc_on_batch(self, angles_cpu: torch.Tensor):
         """
         angles_cpu: [B, num_qubits] cpu float32 tensor
@@ -265,6 +279,7 @@ class QuantumAttentionGate(nn.Module):
 
         # angles via CPU linear (no grad path here by design: keep linear in module to be trainable though)
         # Keep the forward consistent; allow gradients to pass only through post? This implementation treats PQC as CPU float32 path.
+        # Note: to_angles is kept on CPU by _apply override, so no explicit .to("cpu") needed
         with torch.no_grad():
             angles_cpu = self.to_angles(summary_cpu)  # [B, num_qubits] float32 CPU
 
@@ -272,6 +287,7 @@ class QuantumAttentionGate(nn.Module):
         qfeat_cpu = self._run_pqc_on_batch(angles_cpu)  # [B, num_qubits] float32 CPU
 
         # Post projection and compute head-wise scales (CPU float32)
+        # Note: post is kept on CPU by _apply override, so no explicit .to("cpu") needed
         head_logits_cpu = self.post(qfeat_cpu)  # [B, n_heads] CPU float32
         scales_cpu = 1.0 + self.cfg.scale_range * torch.tanh(head_logits_cpu)  # [B, n_heads] CPU float32
 
@@ -671,7 +687,7 @@ class Trainer:
         self.tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
         self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.scaler = GradScaler()
+        self.scaler = GradScaler('cuda')
 
         self.train_dl, self.val_dl = dls
 
@@ -700,7 +716,7 @@ class Trainer:
     def save_model(self,):
         self.train_config.model_path.mkdir(exist_ok=True)
         sd = self.model.state_dict()
-        torch.save(self.model,self.train_config.model_path/'captioner.pt')
+        torch.save(sd, self.train_config.model_path/'captioner.pt')
 
 
     def load_best_model(self,):
@@ -716,7 +732,7 @@ class Trainer:
 
         for image, input_ids, labels in prog:
 
-            with autocast():
+            with autocast('cuda'):
                 image = image.to(self.device)
                 input_ids = input_ids.to(self.device)
                 labels = labels.to(self.device)
@@ -750,7 +766,7 @@ class Trainer:
 
         for image, input_ids, labels in prog:
 
-            with autocast():
+            with autocast('cuda'):
                 image = image.to(self.device)
                 input_ids = input_ids.to(self.device)
                 labels = labels.to(self.device)

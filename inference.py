@@ -707,71 +707,13 @@ import os
 import json
 from groq import Groq
 from sentence_transformers import SentenceTransformer
-
-# Updated langchain imports for newer versions
-try:
-    from langchain_community.document_loaders import CSVLoader, DirectoryLoader, TextLoader
-    from langchain_community.vectorstores import Chroma
-    from langchain_core.embeddings import Embeddings
-    from langchain_core.language_models.llms import LLM
-except ImportError:
-    # Fallback for older versions
-    from langchain.document_loaders import CSVLoader, DirectoryLoader, TextLoader
-    from langchain.vectorstores import Chroma
-    from langchain.embeddings.base import Embeddings
-    from langchain.llms.base import LLM
-
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-try:
-    from langchain.chains import LLMChain, create_qa_with_sources_chain, ConversationalRetrievalChain
-    from langchain_core.prompts import PromptTemplate
-    from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-    from langchain_core.memory import ConversationBufferMemory
-except ImportError:
-    from langchain.chains import LLMChain, create_qa_with_sources_chain, ConversationalRetrievalChain
-    from langchain.prompts import PromptTemplate
-    from langchain.chains.combine_documents.stuff import StuffDocumentsChain
-    from langchain.memory import ConversationBufferMemory
-
 from typing import List, Optional, Any
 
-# Custom Groq LLM class
-class GroqLLM(LLM):
-    def __init__(self, api_key: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
-        # Store client as a private attribute to avoid Pydantic validation
-        try:
-            if api_key:
-                self._client = Groq(api_key=api_key)
-            else:
-                # Get API key from environment
-                groq_api_key = os.getenv("GROQ_API_KEY")
-                if not groq_api_key:
-                    raise ValueError("GROQ_API_KEY environment variable not set!")
-                self._client = Groq(api_key=groq_api_key)
-        except Exception as e:
-            print(f"Error initializing Groq client: {e}")
-            raise
-    
-    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
-        completion = self._client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # Updated to current model
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1000,
-            top_p=1,
-            stream=False,
-            stop=stop
-        )
-        return completion.choices[0].message.content
-    
-    @property
-    def _llm_type(self) -> str:
-        return "groq"
+# Updated langchain imports for newer versions
+from langchain_community.document_loaders import CSVLoader
+from langchain_community.vectorstores import Chroma
+from langchain_core.embeddings import Embeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Custom Sentence Transformer Embeddings class
 class SentenceTransformerEmbeddings(Embeddings):
@@ -783,6 +725,9 @@ class SentenceTransformerEmbeddings(Embeddings):
     
     def embed_query(self, text: str) -> List[float]:
         return self.model.encode([text])[0].tolist()
+
+# Initialize RAG components
+print("Initializing RAG system...")
 
 # Load and process data
 loader = CSVLoader(file_path="./Dataset/reports.csv", encoding="utf-8")
@@ -797,57 +742,61 @@ documents = text_splitter.split_documents(data)
 
 # Use free sentence transformer embeddings
 embedding_model = SentenceTransformerEmbeddings()
-db = Chroma.from_documents(
-    documents,
-    embedding_model,
-    persist_directory="./chroma"
-)
-# Note: db.persist() is no longer needed in Chroma 0.4.x+ as docs are automatically persisted
 
+# Check if chroma db already exists, otherwise create it
+try:
+    db = Chroma(
+        persist_directory="./chroma",
+        embedding_function=embedding_model,
+    )
+    print(f"Loaded existing Chroma database with {db._collection.count()} documents")
+except:
+    print("Creating new Chroma database...")
+    db = Chroma.from_documents(
+        documents,
+        embedding_model,
+        persist_directory="./chroma"
+    )
+    print(f"Created Chroma database with {len(documents)} documents")
 
-# Initialize Groq LLM
-llm = GroqLLM()  # Uses GROQ_API_KEY environment variable
+# Initialize Groq client for RAG (only if API key is available)
+try:
+    groq_client = Groq()  # Uses GROQ_API_KEY environment variable
+    print("Groq client initialized successfully for RAG")
+except Exception as e:
+    print(f"Warning: Could not initialize Groq client for RAG: {e}")
+    groq_client = None
 
-condense_question_prompt = """Given the following conversation and a follow up question, rephrase the follow up question to be a standalone question, in its original language.\
-Make sure to avoid using any unclear pronouns.
+def rag_query(question: str, context_docs: List[Any], groq_client: Groq) -> str:
+    """
+    Simple RAG implementation using Groq API with retrieved context
+    """
+    # Combine context from retrieved documents
+    context = "\n\n".join([doc.page_content for doc in context_docs])
+    
+    # Create prompt with context
+    prompt = f"""Based on the following medical report context, answer the question.
 
-Chat History:
-{chat_history}
-Follow Up Input: {question}
-Standalone question:"""
+Context:
+{context}
 
-condense_question_prompt = PromptTemplate.from_template(condense_question_prompt)
+Question: {question}
 
-condense_question_chain = LLMChain(
-    llm=llm,
-    prompt=condense_question_prompt,
-)
-memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-qa_chain = create_qa_with_sources_chain(llm)
-doc_prompt = PromptTemplate(
-    template="Content: {page_content}",
-    input_variables=["page_content"],
-)
+Answer (be concise and medical):"""
+    
+    # Query Groq API
+    completion = groq_client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        max_tokens=500,
+        top_p=1,
+        stream=False
+    )
+    
+    return completion.choices[0].message.content
 
-final_qa_chain = StuffDocumentsChain(
-    llm_chain=qa_chain,
-    document_variable_name="context",
-    document_prompt=doc_prompt,
-)
-
-# Load the existing Chroma database with sentence transformer embeddings
-db = Chroma(
-    persist_directory="./chroma",
-    embedding_function=SentenceTransformerEmbeddings(),
-)
-
-retrieval_qa = ConversationalRetrievalChain(
-    question_generator=condense_question_chain,
-    retriever=db.as_retriever(),
-    memory=memory,
-    combine_docs_chain=final_qa_chain,
-)
-questions = ["What is the indication in the ","What is impression in the ", "Write complete summary of findings   in "]
+print("RAG system initialized successfully!")
 
 
 import json
@@ -938,23 +887,27 @@ def generate_report_with_streaming(image):
 
 def generate_report(image):
     """
-    Main report generation function - tries RAG first, falls back to simple method
+    Main report generation function - uses RAG approach with fallback to simple API
     """
+    # RAG APPROACH
     try:
-        # Try the RAG approach first
         det = False
         t = np.random.uniform(0.5,1.5)
         caption = generate_caption(image,temperature=t,deterministic=det)
         res = []
-        questions = ["What is the indication in the ","What is impression in the ", "Write complete summary of findings   in "]
+        questions = [
+            f"What is the clinical indication for {caption}?",
+            f"What is the radiological impression for {caption}?",
+            f"Write complete summary of findings for {caption}"
+        ]
         
         for question in questions:
-            response = retrieval_qa.run(question+caption)
-            if isinstance(response, str):
-                res.append(response)
-            else:
-                response = json.loads(response)
-                res.append(response["answer"])
+            # Retrieve relevant documents from vector store
+            relevant_docs = db.similarity_search(question, k=3)
+            # Use RAG query with retrieved context
+            response = rag_query(question, relevant_docs, groq_client)
+            res.append(response)
+        
         return res
     except Exception as e:
         print(f"RAG approach failed: {e}")
